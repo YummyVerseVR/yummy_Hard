@@ -22,7 +22,7 @@ from pathlib import Path
 API_ENDPOINT = "http://upiscium.f5.si:8001"
 
 # シリアル
-PORT = "/dev/cu.usbmodem11301"
+PORT = "/dev/cu.usbmodem2101"
 BAUDRATE = 9600
 SER_TIMEOUT = 1
 RETRY_SEC = 2

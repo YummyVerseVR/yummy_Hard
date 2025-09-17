@@ -4,7 +4,7 @@
 import time, wave, serial, traceback, sys, os, struct, subprocess, tempfile
 from pathlib import Path
 
-PORT = "/dev/cu.usbmodem11301"
+PORT = "/dev/cu.usbmodem21301"
 BAUDRATE = 9600
 AUDIO_FILE = "audio.wav"
 SEG_SEC = 1.0
