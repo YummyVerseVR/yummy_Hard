@@ -7,7 +7,7 @@ Arduinoが "close" を送ってきたら audio.wav の続きを1秒だけ再生�
 プロトコル（このArduinoコードに合わせた最終形）:
 PC → Arduino:
   <up,hold,down,d5,d6>\n     # 例: "50,100,33,55,50\n" （カンマ区切り / 改行で確定）
-Arduino → PC:
+Arduino → PC
   任意ログ（ACK不要）/ 将来 "close" を送るならPCで1秒再生
 """
 
