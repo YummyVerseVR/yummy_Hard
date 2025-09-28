@@ -108,11 +108,9 @@ def _bytes_to_numpy(pcm: bytes, channels: int, sampwidth: int):
     elif sampwidth == 3:
         # 24-bit PCM -> int32 に拡張 → float32 正規化
         b = np.frombuffer(pcm, dtype=np.uint8)
-        # 3バイト→4バイト展開
         a32 = (b[0::3].astype(np.uint32) |
                (b[1::3].astype(np.uint32) << 8) |
                (b[2::3].astype(np.uint32) << 16))
-        # 符号拡張
         sign_mask = 1 << 23
         a32 = a32.astype(np.int32)
         a32 = (a32 ^ sign_mask) - sign_mask
@@ -132,7 +130,6 @@ def _bytes_to_numpy(pcm: bytes, channels: int, sampwidth: int):
 
 def play_blocking(pcm: bytes, channels: int, sampwidth: int, framerate: int):
     arr, kind = _bytes_to_numpy(pcm, channels, sampwidth)
-    # blocking=True で再生が終わるまで待機（simpleaudio と同等の挙動）
     sd.play(arr, framerate, blocking=True)
 
 def open_wav(path: str) -> wave.Wave_read:
@@ -485,6 +482,12 @@ def main():
     try:
         ser = serial.Serial(PORT, BAUDRATE, timeout=SER_TIMEOUT)
         time.sleep(2)  # UNO R4の自動リセット待ち
+
+        # ★★ 追加：起動時に "new\n" を送信（改行付き） ★★
+        ser.write(("new\n").encode(ENCODING))
+        ser.flush()
+        log("[send] new")
+
     except serial.SerialException:
         print(f"シリアルポート {PORT} に接続できません。ポート名を確認してください。")
         return
