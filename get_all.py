@@ -1,3 +1,4 @@
+# ---- スレッド: 受信（open/close対応） & 再生（trimmed.wav） ----
 # -*- coding: utf-8 -*-
 """
 QRで user_id を取得 → APIから audio と param(chewiness/firmness) を取得
@@ -33,9 +34,9 @@ import numpy as np
 import sounddevice as sd
 
 # ========= 設定 =========
-API_ENDPOINT = "http://upiscium.f5.si:8001"
+API_ENDPOINT = "http://yummy-control-server.upiscium.f5.si/"
 DB_BASE = API_ENDPOINT  # /{user_id}/param
-PORT = "/dev/cu.usbmodem1101"   # ←環境に合わせて（Win: "COM3" 等, Linux: "/dev/ttyACM0" 等）
+PORT = "/dev/tty.usbserial-210"   # ←環境に合わせて（Win: "COM3" 等, Linux: "/dev/ttyACM0" 等）
 BAUDRATE = 115200
 SER_TIMEOUT = 1
 ENCODING = "utf-8"
@@ -69,9 +70,18 @@ class ParamGetter:
 
 # ---- マッピング ----
 FIRMNESS_TO_DUTY = {
-    10: (80, 60), 9: (75, 58), 8: (70, 56), 7: (65, 54), 6: (60, 52),
-    5: (55, 50), 4: (50, 48), 3: (45, 46), 2: (40, 44), 1: (40, 42)
+    10: (1.0, 5000, 5010),
+    9:  (0.95, 5000, 5010),
+    8:  (0.9, 5000, 5010),
+    7:  (0.85, 5000, 5010),
+    6:  (0.8, 5000, 5010),
+    5:  (0.75, 5000, 5010),
+    4:  (0.7, 5000, 5010),
+    3:  (0.65, 5000, 5010),
+    2:  (0.6, 5000, 5010),
+    1:  (0.6, 5000, 5010)
 }
+
 CHEWINESS_TO_SEQ = {
     10: (150, 300, 100), 9: (136, 273, 91), 8: (120, 240, 80), 7: (107, 214, 71),
     6: (88, 176, 59), 5: (75, 150, 50), 4: (60, 120, 40), 3: (50, 100, 33),
@@ -87,8 +97,8 @@ def clamp10(x: Any) -> int:
 
 def compose_ctrl_line(chewiness: int, firmness: int) -> str:
     up, hold, down = CHEWINESS_TO_SEQ[int(chewiness)]
-    d5, d6 = FIRMNESS_TO_DUTY[int(firmness)]
-    return f"{up},{hold},{down},{d5},{d6}"
+    power, c1, c2 = FIRMNESS_TO_DUTY[int(firmness)]
+    return f"{up},{hold},{down},{power},{c1},{c2}"
 
 # ---- 再生（sounddevice 版）----
 def _bytes_to_numpy(pcm: bytes, channels: int, sampwidth: int):
@@ -369,7 +379,6 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
             except Exception:
                 pass
             wf = None
-        # 再生は常に trimmed.wav を使用
         wf = open_wav(AUDIO_TRIMMED)
         framerate = wf.getframerate()
         channels = wf.getnchannels()
@@ -388,90 +397,147 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
         except Exception as e:
             log(f"[warn] 初回WAVオープン失敗: {e}")
 
-    # --- open→close 間隔の移動平均用 ---
-    last_open_ts: Optional[float] = None
-    recent_intervals: deque = deque(maxlen=3)
-    DEFAULT_FALLBACK_SEC = 0.5  # データが無いときのフォールバック
-    MIN_SEC, MAX_SEC = 0.05, 5.0  # 安全のための下限・上限
+    # --- 状態変数 ---
+    playing = False                  # 再生中フラグ（自前で管理）
+    play_end_at: Optional[float] = None
+    scheduled_play_at: Optional[float] = None  # 「close」受信後の予約開始時刻
 
     while not stop_event.is_set():
         try:
+            # 1) シリアル受信
             if ser.in_waiting > 0:
                 received = ser.readline().decode(ENCODING, errors="ignore").strip()
                 if not received:
                     continue
 
-                # 任意ログ
                 print(f"\nArduinoからの応答: {received}")
 
-                # ---- "open" 到着：時刻記録 ----
                 if received.lower() == "open":
-                    last_open_ts = time.time()
-                    log("[event] open")
+                    # すぐに停止し、予約もリセット
+                    log("[event] open -> stop playback immediately")
+                    sd.stop()
+                    playing = False
+                    play_end_at = None
+                    scheduled_play_at = None
                     continue
 
-                # ---- "close" 到着：直近区間を記録→移動平均で再生 ----
                 if received.lower() == "close":
-                    log("[event] close")
-
-                    # WAVのリロード（trimmed.wav の更新に追随）
+                    # 0.1秒後に0.3秒だけ再生するよう予約
+                    log("[event] close -> schedule playback")
                     if shared.consume_reload() or wf is None:
                         try:
                             ensure_wav_open()
+                            log("[audio] reloaded trimmed.wav")
                         except Exception as e:
                             log(f"[err] WAVが開けず再生不可: {e}")
-                            continue
-
-                    # open→close 間隔（秒）を計算
-                    now = time.time()
-                    if last_open_ts is not None:
-                        interval = max(0.0, now - last_open_ts)
-                        recent_intervals.append(interval)
-                        last_open_ts = None  # 1区間分消費
-                    else:
-                        log("[warn] 直前に open が無いので区間不明。フォールバックを使用します.")
-
-                    # 移動平均秒数を決定
-                    if len(recent_intervals) > 0:
-                        avg_sec = sum(recent_intervals) / len(recent_intervals)
-                    else:
-                        avg_sec = DEFAULT_FALLBACK_SEC
-                    # クリップ（安全対策）
-                    avg_sec = max(MIN_SEC, min(MAX_SEC, avg_sec))
-
-                    log(f"[dur] intervals={list(map(lambda x: round(x,3), recent_intervals))} -> avg={avg_sec:.3f}s")
-
-                    # 任意ログ（誰のparamで再生しているか）
-                    uid, param = shared.get_param_snapshot()
-                    if uid is not None:
-                        log(f"[param] using (user_id={uid}): {param}")
-
-                    # 再生（trimmed.wav）
-                    log(f"[play] start {avg_sec:.3f}s")
-                    try:
-                        pcm = read_exact_sec(wf, avg_sec)
-                        play_blocking(pcm, channels, sampwidth, framerate)
-                        log("[play] done")
-                    except Exception:
-                        log("[err] 再生中に例外発生:")
-                        traceback.print_exc()
+                    scheduled_play_at = time.time() + WAIT_BEFORE_PLAY_SEC
                     continue
 
-                # （その他の文字列は単なるログとして扱う）
             else:
-                if shared.consume_reload():
+                # ファイル更新通知（再生していないときにだけ開き直し）
+                if not playing and shared.consume_reload():
                     try:
                         ensure_wav_open()
+                        log("[audio] reloaded trimmed.wav")
                     except Exception as e:
                         log(f"[warn] WAVリロード失敗: {e}")
-                time.sleep(0.01)
+                time.sleep(0.003)
+
+            # 2) 再生の終了判定（自前のタイマーで管理）
+            if playing and play_end_at is not None and time.time() >= play_end_at:
+                log("[play] done (timer)")
+                playing = False
+                play_end_at = None
+
+            # 3) 予約時刻を過ぎていて未再生なら再生を開始（0.3秒だけ）
+            if (not playing) and (scheduled_play_at is not None) and (time.time() >= scheduled_play_at) and (wf is not None):
+                scheduled_play_at = None  # 使い切り
+
+                # 任意ログ（誰のparamで再生しているか）
+                uid, param = shared.get_param_snapshot()
+                if uid is not None:
+                    log(f"[param] using (user_id={uid}): {param}")
+
+                try:
+                    log(f"[play] start {FIXED_PLAY_SEC:.3f}s")
+                    pcm = read_exact_sec(wf, FIXED_PLAY_SEC)
+                    play_nonblocking(pcm, channels, sampwidth, framerate)
+                    playing = True
+                    play_end_at = time.time() + FIXED_PLAY_SEC
+                except Exception:
+                    log("[err] 再生中に例外発生:")
+                    traceback.print_exc()
+                    playing = False
+                    play_end_at = None
+
         except serial.SerialException as e:
             log(f"[warn] シリアル受信エラー: {e}")
             time.sleep(0.5)
         except Exception as e:
             log(f"[warn] 受信スレッド例外: {e}")
             time.sleep(0.1)
+
     log("[receiver] 終了")
+
+
+
+# ---- メイン ----
+def main():
+    stop_event = threading.Event()
+    shared = SharedAudioState(AUDIO_TRIMMED)
+
+    # シリアルを開く
+    try:
+        ser = serial.Serial(PORT, BAUDRATE, timeout=SER_TIMEOUT)
+        time.sleep(2)  # UNO R4の自動リセット待ち
+
+        # ★★ 追加：起動時に "new\n" を送信（改行付き） ★★
+        ser.write(("new\n").encode(ENCODING))
+        ser.flush()
+        log("[send] new")
+
+    except serial.SerialException:
+        print(f"シリアルポート {PORT} に接続できません。ポート名を確認してください。")
+        return
+
+    # 受信スレッド開始
+    rx_thread = threading.Thread(target=continuously_read_from_arduino, args=(ser, stop_event, shared), daemon=True)
+    rx_thread.start()
+
+    # QRスレッド開始
+    cam_thread = threading.Thread(target=qr_download_thread, args=(shared, stop_event), daemon=True)
+    cam_thread.start()
+
+    log("起動：QR→音声DL→無音トリム(trimmed.wav) & パラメ取得。新しい 5値 が来たら '<up,hold,down,d5,d6>\\n' を1行送信。Ctrl+Cで終了。")
+
+    try:
+        while True:
+            ctrl_line = shared.pop_ctrl_line()
+            if ctrl_line:
+                try:
+                    # ★ このArduinoコード用：1行だけ送る（[send]なし）
+                    ser.write((ctrl_line + "\n").encode(ENCODING))
+                    ser.flush()
+                    log(f"[send] {ctrl_line}")
+                except serial.SerialException as e:
+                    log(f"[warn] 送信失敗: {e}")
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        log("[info] 停止要求。終了します。")
+    finally:
+        stop_event.set()
+        try:
+            ser.close()
+        except Exception:
+            pass
+        rx_thread.join(timeout=2.0)
+        cam_thread.join(timeout=2.0)
+        log("[main] 終了")
+
+if __name__ == "__main__":
+    main()
+
+
 
 # ---- メイン ----
 def main():
