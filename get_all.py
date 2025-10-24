@@ -379,6 +379,9 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
             except Exception:
                 pass
             wf = None
+
+        # 再生は常に trimmed.wav を使用
+
         wf = open_wav(AUDIO_TRIMMED)
         framerate = wf.getframerate()
         channels = wf.getnchannels()
@@ -397,10 +400,12 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
         except Exception as e:
             log(f"[warn] 初回WAVオープン失敗: {e}")
 
+audio
     # --- 状態変数 ---
     playing = False                  # 再生中フラグ（自前で管理）
     play_end_at: Optional[float] = None
     scheduled_play_at: Optional[float] = None  # 「close」受信後の予約開始時刻
+
 
     while not stop_event.is_set():
         try:
@@ -409,6 +414,7 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
                 received = ser.readline().decode(ENCODING, errors="ignore").strip()
                 if not received:
                     continue
+
 
                 print(f"\nArduinoからの応答: {received}")
 
@@ -424,14 +430,17 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
                 if received.lower() == "close":
                     # 0.1秒後に0.3秒だけ再生するよう予約
                     log("[event] close -> schedule playback")
+
                     if shared.consume_reload() or wf is None:
                         try:
                             ensure_wav_open()
                             log("[audio] reloaded trimmed.wav")
                         except Exception as e:
                             log(f"[err] WAVが開けず再生不可: {e}")
+
                     scheduled_play_at = time.time() + WAIT_BEFORE_PLAY_SEC
                     continue
+
 
             else:
                 # ファイル更新通知（再生していないときにだけ開き直し）
