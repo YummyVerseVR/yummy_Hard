@@ -2,19 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 QRで user_id を取得 → APIから audio と param(chewiness/firmness) を取得
-param をテーブルで up hold down d5 d6 に変換 → Arduinoへ (1行のみ送信)
+param をテーブルで up hold down power c1 c2 に変換 → Arduinoへ (1行のみ送信)
 Arduinoが "open" と "close" を送ってくる想定で、
-直近3回分の open→close 間隔（秒）の移動平均だけ音声を再生（sounddevice）。
-音声は audio.wav を ffmpeg で保守的トリムした trimmed.wav を再生する。
+close 受信のたびに 0.1秒待って 0.3秒だけ音声を再生（sounddevice・非ブロッキング）。
+音声は audio.wav を ffmpeg の silenceremove でトリムした trimmed.wav を再生する。
 
 プロトコル（このArduinoコードに合わせた最終形）:
 PC → Arduino:
-  <up,hold,down,d5,d6>\n     # 例: "50,100,33,55,50\n" （カンマ区切り / 改行で確定）
+  <up,hold,down,power,c1,c2>\n
+  new\n                      # 起動時に送信
+  next\n                     # Shift+N で送信（次ラウンドへ）
 Arduino → PC:
   任意ログ / "open" / "close"
 """
 
 import os
+import sys
 import time
 import wave
 import cv2
@@ -36,7 +39,7 @@ import sounddevice as sd
 # ========= 設定 =========
 API_ENDPOINT = "http://yummy-control-server.upiscium.f5.si/"
 DB_BASE = API_ENDPOINT  # /{user_id}/param
-PORT = "/dev/tty.usbmodem1101"   # ←環境に合わせて（Win: "COM3" 等, Linux: "/dev/ttyACM0" 等）
+PORT = "/dev/tty.usbmodem2101"   # ←環境に合わせて（Win: "COM3" 等, Linux: "/dev/ttyACM0" 等）
 BAUDRATE = 115200
 SER_TIMEOUT = 1
 ENCODING = "utf-8"
@@ -45,16 +48,14 @@ AUDIO_RAW = "audio.wav"       # ダウンロード保存先（生）
 AUDIO_TRIMMED = "trimmed.wav" # 再生に使うファイル（トリム後）
 
 # —— 無音トリムのデフォルト（ゆるめ＝切りすぎ防止）——
-TRIM_THRESHOLD_DB = -50.0   # 小さくすると「ゆるい」判定（例: -55, -60）
-TRIM_MIN_SIL_MS   = 600     # 大きくすると「ゆるい」判定（例: 700, 800）
-TRIM_REMOVE_MID   = False   # 途中の無音も消すなら True（通常は False 推奨）
-# ========================
+TRIM_THRESHOLD_DB = -50.0
+TRIM_MIN_SIL_MS   = 600
+TRIM_REMOVE_MID   = False
 
 CAM_INDEX = 0
 CAM_POLL_DELAY = 0.01
-# ========================
 
-
+# ---- ログ ----
 def log(msg: str):
     print(time.strftime("[%H:%M:%S]"), msg, flush=True)
 
@@ -71,16 +72,16 @@ class ParamGetter:
 
 # ---- マッピング ----
 FIRMNESS_TO_DUTY = {
-    10: (1.0, 5000, 5010),
-    9:  (0.95, 5000, 5010),
-    8:  (0.9, 5000, 5010),
-    7:  (0.85, 5000, 5010),
-    6:  (0.8, 5000, 5010),
-    5:  (0.75, 5000, 5010),
-    4:  (0.7, 5000, 5010),
-    3:  (0.65, 5000, 5010),
-    2:  (0.6, 5000, 5010),
-    1:  (0.6, 5000, 5010)
+    10: (1.0, 5000, 8000),
+    9:  (0.95, 5000, 8000),
+    8:  (0.9, 5000, 8000),
+    7:  (0.85, 5000, 8000),
+    6:  (0.8, 5000, 8000),
+    5:  (0.75, 5000, 8000),
+    4:  (0.7, 5000, 8000),
+    3:  (0.65, 5000, 8000),
+    2:  (0.6, 5000, 8000),
+    1:  (0.6, 5000, 8000)
 }
 
 CHEWINESS_TO_SEQ = {
@@ -105,19 +106,16 @@ def compose_ctrl_line(chewiness: int, firmness: int) -> str:
 def _bytes_to_numpy(pcm: bytes, channels: int, sampwidth: int):
     """PCMバイト列を sounddevice で再生できる numpy 配列へ変換"""
     if sampwidth == 2:
-        # 16-bit signed
         arr = np.frombuffer(pcm, dtype=np.int16)
         if channels > 1:
             arr = arr.reshape(-1, channels)
-        return arr, None  # dtypeそのまま再生
+        return arr, None
     elif sampwidth == 1:
-        # 8-bit unsigned/signed混在の可能性あり → 安全に float32 正規化
         a = np.frombuffer(pcm, dtype=np.int8).astype(np.float32) / 128.0
         if channels > 1:
             a = a.reshape(-1, channels)
         return a, "float32"
     elif sampwidth == 3:
-        # 24-bit PCM -> int32 に拡張 → float32 正規化
         b = np.frombuffer(pcm, dtype=np.uint8)
         a32 = (b[0::3].astype(np.uint32) |
                (b[1::3].astype(np.uint32) << 8) |
@@ -130,8 +128,6 @@ def _bytes_to_numpy(pcm: bytes, channels: int, sampwidth: int):
             a = a.reshape(-1, channels)
         return a, "float32"
     elif sampwidth == 4:
-        # 多くは 32-bit float か 32-bit int。WAV エンコーディングによるが、
-        # 安全策として int32 として読み、float32 正規化して再生。
         a32 = np.frombuffer(pcm, dtype=np.int32).astype(np.float32) / (2**31)
         if channels > 1:
             a32 = a32.reshape(-1, channels)
@@ -139,16 +135,10 @@ def _bytes_to_numpy(pcm: bytes, channels: int, sampwidth: int):
     else:
         raise ValueError(f"Unsupported sample width: {sampwidth} byte/sample")
 
-# ---- 追記：非ブロッキング再生（仕組みはそのまま）----
 def play_nonblocking(pcm: bytes, channels: int, sampwidth: int, framerate: int):
     arr, kind = _bytes_to_numpy(pcm, channels, sampwidth)
-    # 念のため、開始前に一度停止（openで止め損ねたケースの保険）
     sd.stop()
     sd.play(arr, framerate, blocking=False)
-
-def play_blocking(pcm: bytes, channels: int, sampwidth: int, framerate: int):
-    arr, kind = _bytes_to_numpy(pcm, channels, sampwidth)
-    sd.play(arr, framerate, blocking=True)
 
 def open_wav(path: str) -> wave.Wave_read:
     p = Path(path)
@@ -175,14 +165,12 @@ def read_exact_sec(wf: wave.Wave_read, sec: float) -> bytes:
 def _build_silenceremove(th_db: float, min_ms: int, remove_mid: bool) -> str:
     sec = max(0.0, min_ms / 1000.0)
     if not remove_mid:
-        # 前後のみトリム
         return (
             f"silenceremove="
             f"start_periods=1:start_silence={sec}:start_threshold={th_db}dB:"
             f"stop_periods=1:stop_silence={sec}:stop_threshold={th_db}dB"
         )
     else:
-        # 途中の長い無音も削除（切れすぎ注意）
         return (
             f"silenceremove="
             f"start_periods=1:start_silence={sec}:start_threshold={th_db}dB,"
@@ -194,7 +182,6 @@ def run_ffmpeg_trim(in_path: Path, out_path: Path,
                     th_db: float = TRIM_THRESHOLD_DB,
                     min_ms: int = TRIM_MIN_SIL_MS,
                     remove_mid: bool = TRIM_REMOVE_MID) -> bool:
-    """成功で True。ffmpeg 未導入などで失敗したら False を返す。"""
     if shutil.which("ffmpeg") is None:
         log("❌ ffmpeg が見つかりません（macOS: `brew install ffmpeg` 推奨）。生WAVをそのまま使用します。")
         try:
@@ -227,6 +214,8 @@ class SharedAudioState:
         self.latest_user_id: Optional[str] = None
         self.latest_param: Optional[Dict[str, Any]] = None
         self.pending_ctrl_line: Optional[str] = None
+        # ★ 追加：Shift+N で QR 検出をリセットするためのフラグ
+        self.qr_reset_event = threading.Event()
 
     def signal_reload(self):
         with self.lock:
@@ -260,7 +249,17 @@ class SharedAudioState:
             self.pending_ctrl_line = None
             return line
 
-# ---- QR安全ラッパー ----
+    # ★ 追加：QR リセット要求
+    def request_qr_reset(self):
+        self.qr_reset_event.set()
+
+    def consume_qr_reset(self) -> bool:
+        if self.qr_reset_event.is_set():
+            self.qr_reset_event.clear()
+            return True
+        return False
+
+# ---- QR 安全ラッパー ----
 def safe_iter_qr_strings(qr: cv2.QRCodeDetector, frame) -> List[str]:
     results: List[str] = []
     try:
@@ -313,6 +312,11 @@ def qr_download_thread(shared: SharedAudioState, stop_event: threading.Event):
 
     try:
         while not stop_event.is_set():
+            # ★ Shift+N によるリセット要求
+            if shared.consume_qr_reset():
+                last_id = None
+                log("[qr] reset requested -> start from first QR again")
+
             ok, frame = cap.read()
             if not ok:
                 time.sleep(0.05)
@@ -374,9 +378,10 @@ def qr_download_thread(shared: SharedAudioState, stop_event: threading.Event):
         cv2.destroyAllWindows()
         log("[camera] 終了")
 
-# ---- 追記：タイミング定数 ----
-WAIT_BEFORE_PLAY_SEC = 0   # close受信→0.1秒待つ
-FIXED_PLAY_SEC       = 0.3   # 0.3秒だけ再生
+# ---- タイミング定数（ここが肝） ----
+WAIT_BEFORE_PLAY_SEC = 0.1   # close受信→0.1秒待つ
+FIXED_PLAY_SEC       = 0.3   # 0.3秒だけ再生（非ブロッキング）
+
 # ---- スレッド: 受信（open/close対応） & 再生（trimmed.wav） ----
 def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Event, shared: SharedAudioState):
     wf = None
@@ -390,9 +395,6 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
             except Exception:
                 pass
             wf = None
-
-        # 再生は常に trimmed.wav を使用
-
         wf = open_wav(AUDIO_TRIMMED)
         framerate = wf.getframerate()
         channels = wf.getnchannels()
@@ -411,12 +413,10 @@ def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Eve
         except Exception as e:
             log(f"[warn] 初回WAVオープン失敗: {e}")
 
-audio
-    # --- 状態変数 ---
-    playing = False                  # 再生中フラグ（自前で管理）
+    # 再生状態
+    playing = False
     play_end_at: Optional[float] = None
-    scheduled_play_at: Optional[float] = None  # 「close」受信後の予約開始時刻
-
+    scheduled_play_at: Optional[float] = None
 
     while not stop_event.is_set():
         try:
@@ -426,11 +426,9 @@ audio
                 if not received:
                     continue
 
-
                 print(f"\nArduinoからの応答: {received}")
 
                 if received.lower() == "open":
-                    # すぐに停止し、予約もリセット
                     log("[event] open -> stop playback immediately")
                     sd.stop()
                     playing = False
@@ -439,19 +437,15 @@ audio
                     continue
 
                 if received.lower() == "close":
-                    # 0.1秒後に0.3秒だけ再生するよう予約
                     log("[event] close -> schedule playback")
-
                     if shared.consume_reload() or wf is None:
                         try:
                             ensure_wav_open()
                             log("[audio] reloaded trimmed.wav")
                         except Exception as e:
                             log(f"[err] WAVが開けず再生不可: {e}")
-
                     scheduled_play_at = time.time() + WAIT_BEFORE_PLAY_SEC
                     continue
-
 
             else:
                 # ファイル更新通知（再生していないときにだけ開き直し）
@@ -463,23 +457,22 @@ audio
                         log(f"[warn] WAVリロード失敗: {e}")
                 time.sleep(0.003)
 
-            # 2) 再生の終了判定（自前のタイマーで管理）
+            # 2) 再生の終了判定
             if playing and play_end_at is not None and time.time() >= play_end_at:
                 log("[play] done (timer)")
                 playing = False
                 play_end_at = None
 
-            # 3) 予約時刻を過ぎていて未再生なら再生を開始（0.3秒だけ）
+            # 3) 予約時刻を過ぎていて未再生なら再生を開始（0.3秒だけ：非ブロッキング）
             if (not playing) and (scheduled_play_at is not None) and (time.time() >= scheduled_play_at) and (wf is not None):
                 scheduled_play_at = None  # 使い切り
 
-                # 任意ログ（誰のparamで再生しているか）
                 uid, param = shared.get_param_snapshot()
                 if uid is not None:
                     log(f"[param] using (user_id={uid}): {param}")
 
                 try:
-                    log(f"[play] start {FIXED_PLAY_SEC:.3f}s")
+                    log(f"[play] start {FIXED_PLAY_SEC:.3f}s (non-blocking)")
                     pcm = read_exact_sec(wf, FIXED_PLAY_SEC)
                     play_nonblocking(pcm, channels, sampwidth, framerate)
                     playing = True
@@ -499,7 +492,57 @@ audio
 
     log("[receiver] 終了")
 
-
+# ---- キーボード監視（Shift+N で next） ----
+def keyboard_watch_thread(shared: SharedAudioState, ser: serial.Serial, stop_event: threading.Event):
+    """
+    Shift+N（大文字 'N'）で:
+      1) Arduino に "next\n" を送信
+      2) 再生停止（sd.stop()）
+      3) QR検出をリセット（同じQRでも再検出できるように）
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+            while not stop_event.is_set():
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch == 'N':  # Shift+N
+                        try:
+                            ser.write(b"next\n"); ser.flush()
+                            log("[key] Shift+N -> [send] next")
+                        except Exception as e:
+                            log(f"[warn] next送信失敗: {e}")
+                        try:
+                            sd.stop()
+                        except Exception:
+                            pass
+                        shared.request_qr_reset()
+                time.sleep(0.02)
+        else:
+            import tty, termios, select
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)  # 1文字ずつ即時取得
+                while not stop_event.is_set():
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.02)
+                    if rlist:
+                        ch = sys.stdin.read(1)
+                        if ch == 'N':  # Shift+N
+                            try:
+                                ser.write(b"next\n"); ser.flush()
+                                log("[key] Shift+N -> [send] next")
+                            except Exception as e:
+                                log(f"[warn] next送信失敗: {e}")
+                            try:
+                                sd.stop()
+                            except Exception:
+                                pass
+                            shared.request_qr_reset()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    except Exception as e:
+        log(f"[warn] keyboard thread error: {e}")
 
 # ---- メイン ----
 def main():
@@ -511,7 +554,7 @@ def main():
         ser = serial.Serial(PORT, BAUDRATE, timeout=SER_TIMEOUT)
         time.sleep(2)  # UNO R4の自動リセット待ち
 
-        # ★★ 追加：起動時に "new\n" を送信（改行付き） ★★
+        # 起動時 "new\n"
         ser.write(("new\n").encode(ENCODING))
         ser.flush()
         log("[send] new")
@@ -520,22 +563,25 @@ def main():
         print(f"シリアルポート {PORT} に接続できません。ポート名を確認してください。")
         return
 
-    # 受信スレッド開始
+    # 受信スレッド
     rx_thread = threading.Thread(target=continuously_read_from_arduino, args=(ser, stop_event, shared), daemon=True)
     rx_thread.start()
 
-    # QRスレッド開始
+    # QRスレッド
     cam_thread = threading.Thread(target=qr_download_thread, args=(shared, stop_event), daemon=True)
     cam_thread.start()
 
-    log("起動：QR→音声DL→無音トリム(trimmed.wav) & パラメ取得。新しい 5値 が来たら '<up,hold,down,d5,d6>\\n' を1行送信。Ctrl+Cで終了。")
+    # キーボード監視スレッド（Shift+N -> next）
+    key_thread = threading.Thread(target=keyboard_watch_thread, args=(shared, ser, stop_event), daemon=True)
+    key_thread.start()
+
+    log("起動：QR→音声DL→無音トリム(trimmed.wav) & パラメ取得。Shift+Nで next を送信し、再生停止＆QRを最初から再検出。Ctrl+Cで終了。")
 
     try:
         while True:
             ctrl_line = shared.pop_ctrl_line()
             if ctrl_line:
                 try:
-                    # ★ このArduinoコード用：1行だけ送る（[send]なし）
                     ser.write((ctrl_line + "\n").encode(ENCODING))
                     ser.flush()
                     log(f"[send] {ctrl_line}")
@@ -547,60 +593,16 @@ def main():
     finally:
         stop_event.set()
         try:
+            sd.stop()
+        except Exception:
+            pass
+        try:
             ser.close()
         except Exception:
             pass
         rx_thread.join(timeout=2.0)
         cam_thread.join(timeout=2.0)
-        log("[main] 終了")
-
-if __name__ == "__main__":
-    main()
-
-
-
-def main():
-    stop_event = threading.Event()
-    shared = SharedAudioState(AUDIO_TRIMMED)
-
-    try:
-        ser = serial.Serial(PORT, BAUDRATE, timeout=SER_TIMEOUT)
-        time.sleep(2)
-        ser.write(b"new\n"); ser.flush()
-        log("[send] new")
-    except serial.SerialException:
-        print(f"シリアルポート {PORT} に接続できません。ポート名を確認してください。")
-        return
-
-    rx_thread = threading.Thread(target=continuously_read_from_arduino, args=(ser, stop_event, shared), daemon=True)
-    rx_thread.start()
-
-    cam_thread = threading.Thread(target=qr_download_thread, args=(shared, stop_event), daemon=True)
-    cam_thread.start()
-
-    log("起動：QR→音声DL→無音トリム ... Ctrl+Cで終了。")
-
-    try:
-        while True:
-            ctrl_line = shared.pop_ctrl_line()
-            if ctrl_line:
-                try:
-                    ser.write((ctrl_line + "\n").encode(ENCODING))
-                    ser.flush()
-                    log(f"[send] {ctrl_line}")
-                except serial.SerialException as e:
-                    log(f"[warn] 送信失敗: {e}")
-            time.sleep(0.02)
-    except KeyboardInterrupt:
-        log("[info] 停止要求。終了します。")
-    finally:
-        stop_event.set()
-        try: sd.stop()
-        except Exception: pass
-        try: ser.close()
-        except Exception: pass
-        rx_thread.join(timeout=2.0)
-        cam_thread.join(timeout=2.0)
+        key_thread.join(timeout=2.0)
         log("[main] 終了")
 
 if __name__ == "__main__":
