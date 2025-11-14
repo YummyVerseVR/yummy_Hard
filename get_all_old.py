@@ -39,7 +39,7 @@ import sounddevice as sd
 # ========= 設定 =========
 API_ENDPOINT = "http://yummy-control-server.upiscium.f5.si/"
 DB_BASE = API_ENDPOINT  # /{user_id}/param
-PORT = "/dev/tty.usbmodem2101"   # ←環境に合わせて（Win: "COM3" 等, Linux: "/dev/ttyACM0" 等）
+PORT = "/dev/tty.usbmodem1401"   # ←環境に合わせて（Win: "COM3" 等, Linux: "/dev/ttyACM0" 等）
 BAUDRATE = 115200
 SER_TIMEOUT = 1
 ENCODING = "utf-8"
@@ -380,7 +380,7 @@ def qr_download_thread(shared: SharedAudioState, stop_event: threading.Event):
 
 # ---- タイミング定数（ここが肝） ----
 WAIT_BEFORE_PLAY_SEC = 0.1   # close受信→0.1秒待つ
-FIXED_PLAY_SEC       = 0.3   # 0.3秒だけ再生（非ブロッキング）
+FIXED_PLAY_SEC       = 0.5   # 0.3秒だけ再生（非ブロッキング）
 
 # ---- スレッド: 受信（open/close対応） & 再生（trimmed.wav） ----
 def continuously_read_from_arduino(ser: serial.Serial, stop_event: threading.Event, shared: SharedAudioState):
