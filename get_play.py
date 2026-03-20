@@ -19,10 +19,10 @@ import threading
 from pathlib import Path
 
 # ========= 設定 =========
-API_ENDPOINT = "http://upiscium.f5.si:8001"
+API_ENDPOINT = "https://yummy-control-server.upiscium.dev"
 
 # シリアル
-PORT = "/dev/cu.usbmodem2101"
+PORT = "/dev/tty.usbmodem101"
 BAUDRATE = 9600
 SER_TIMEOUT = 1
 RETRY_SEC = 2

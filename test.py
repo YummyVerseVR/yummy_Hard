@@ -1,5 +1,5 @@
 from get_param import ParamGetter
-API_ENDPOINT = "http://upiscium.f5.si:8001"
+API_ENDPOINT = "https://yummy-control-server.upiscium.dev"
 
 if __name__ == "__main__":
     getter = ParamGetter(API_ENDPOINT)

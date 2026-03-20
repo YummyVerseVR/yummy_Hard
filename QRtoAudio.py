@@ -1,7 +1,7 @@
 import cv2
 import requests
 
-API_ENDPOINT = "http://upiscium.f5.si:8001"
+API_ENDPOINT = "https://yummy-control-server.upiscium.dev"
 
 # QRコード検出器を初期化
 qrCodeDetector = cv2.QRCodeDetector()
